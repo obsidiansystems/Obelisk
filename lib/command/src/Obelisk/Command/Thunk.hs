@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE MultiWayIf #-}
@@ -7,15 +8,22 @@
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE QuasiQuotes #-}
 module Obelisk.Command.Thunk
   ( GitHubSource (..)
   , GitUri (..)
   , ReadThunkError (..)
+  , ReadThunkError (..)
   , ThunkConfig (..)
+  , ThunkData (..)
   , ThunkData (..)
   , ThunkPackConfig (..)
   , ThunkPtr (..)
   , ThunkRev (..)
+  , ThunkScheme (..)
+  , ThunkSource (..)
   , ThunkSource (..)
   , ThunkUpdateConfig (..)
   , createThunk
@@ -29,8 +37,11 @@ module Obelisk.Command.Thunk
   , packThunk
   , parseGitUri
   , readThunk
+  , thunkPtr_rev
+  , thunkPtr_source
   , unpackThunk
   , updateThunk
+  , updateThunkToLatest
   , updateThunkToLatest
   , uriThunkPtr
   ) where
@@ -38,6 +49,7 @@ module Obelisk.Command.Thunk
 import Control.Applicative
 import Control.Exception (displayException, try)
 import qualified Control.Lens as Lens
+import Control.Lens (makeLenses, makeLensesFor, makePrisms, (%~), (.~), _Right)
 import Control.Lens.Indexed hiding ((<.>))
 import Control.Monad
 import Control.Monad.Catch (handle)
@@ -74,25 +86,12 @@ import System.IO.Error
 import System.IO.Temp
 import System.Posix (getSymbolicLinkStatus, modificationTime)
 import qualified Text.URI as URI
+import qualified Text.URI.Lens as URIL
+import qualified Text.URI.QQ as URIQQ
 
 import Obelisk.App (MonadObelisk)
 import Obelisk.CliApp
 import Obelisk.Command.Utils
-
---TODO: Support symlinked thunk data
-data ThunkData
-   = ThunkData_Packed ThunkPtr
-   -- ^ Packed thunk
-   | ThunkData_Checkout (Maybe ThunkPtr)
-   -- ^ Checked out thunk that was unpacked from this pointer
-  deriving (Show, Eq, Ord)
-
--- | A reference to the exact data that a thunk should translate into
-data ThunkPtr = ThunkPtr
-  { _thunkPtr_rev :: ThunkRev
-  , _thunkPtr_source :: ThunkSource
-  }
-  deriving (Show, Eq, Ord)
 
 type NixSha256 = Text --TODO: Use a smart constructor and make this actually verify itself
 
@@ -103,14 +102,6 @@ data ThunkRev = ThunkRev
   }
   deriving (Show, Eq, Ord)
 
--- | A location from which a thunk's data can be retrieved
-data ThunkSource
-   -- | A source specialized for GitHub
-   = ThunkSource_GitHub GitHubSource
-   -- | A plain repo source
-   | ThunkSource_Git GitSource
-   deriving (Show, Eq, Ord)
-
 data GitHubSource = GitHubSource
   { _gitHubSource_owner :: Name Owner
   , _gitHubSource_repo :: Name Repo
@@ -119,7 +110,9 @@ data GitHubSource = GitHubSource
   }
   deriving (Show, Eq, Ord)
 
-newtype GitUri = GitUri URI.URI deriving (Eq, Ord, Show)
+newtype GitUri = GitUri { _gitUri_uri :: URI.URI } deriving (Eq, Ord, Show)
+
+makeLenses 'GitUri
 
 gitUriToText :: GitUri -> Text
 gitUriToText (GitUri uri)
@@ -136,6 +129,45 @@ data GitSource = GitSource
   }
   deriving (Show, Eq, Ord)
 
+makeLensesFor [("_gitSource_url", "gitSource_url")] ''GitSource
+
+-- | A location from which a thunk's data can be retrieved
+data ThunkSource
+   -- | A source specialized for GitHub
+   = ThunkSource_GitHub GitHubSource
+   -- | A plain repo source
+   | ThunkSource_Git GitSource
+   deriving (Show, Eq, Ord)
+
+makePrisms ''ThunkSource
+
+-- | A reference to the exact data that a thunk should translate into
+data ThunkPtr = ThunkPtr
+  { _thunkPtr_rev :: ThunkRev
+  , _thunkPtr_source :: ThunkSource
+  }
+  deriving (Show, Eq, Ord)
+
+makeLenses 'ThunkPtr
+
+--TODO: Support symlinked thunk data
+data ThunkData
+   = ThunkData_Packed ThunkPtr
+   -- ^ Packed thunk
+   | ThunkData_Checkout (Maybe ThunkPtr)
+   -- ^ Checked out thunk that was unpacked from this pointer
+  deriving (Show, Eq, Ord)
+
+-- | Whether or not to override the scheme when packing/unpacking a thunk.
+data ThunkScheme
+  = ThunkScheme_Keep
+  -- ^ Keep the protocol as it was.
+  | ThunkScheme_Https
+  -- ^ Switch to https://host/.... like uri.
+  | ThunkScheme_Ssh
+  -- ^ Switch to ssh://git@host/.... like uri.
+  deriving (Show, Eq, Ord)
+
 newtype ThunkConfig = ThunkConfig
   { _thunkConfig_private :: Maybe Bool
   } deriving Show
@@ -148,6 +180,7 @@ data ThunkUpdateConfig = ThunkUpdateConfig
 data ThunkPackConfig = ThunkPackConfig
   { _thunkPackConfig_force :: Bool
   , _thunkPackConfig_config :: ThunkConfig
+  , _thunkPackConfig_scheme :: ThunkScheme
   } deriving Show
 
 -- | Convert a GitHub source to a regular Git source. Assumes no submodules.
@@ -625,7 +658,7 @@ nixBuildAttrWithCache exprPath attr = do
 updateThunk :: MonadObelisk m => FilePath -> (FilePath -> m a) -> m a
 updateThunk p f = withSystemTempDirectory "obelisk-thunkptr-" $ \tmpDir -> do
   p' <- copyThunkToTmp tmpDir p
-  unpackThunk' True p'
+  unpackThunk' True ThunkScheme_Keep p'
   result <- f p'
   updateThunkFromTmp p'
   return result
@@ -639,14 +672,14 @@ updateThunk p f = withSystemTempDirectory "obelisk-thunkptr-" $ \tmpDir -> do
         return tmpThunk
       Right _ -> failWith "Thunk is not packed"
     updateThunkFromTmp p' = do
-      _ <- packThunk' True (ThunkPackConfig False (ThunkConfig Nothing)) p'
+      _ <- packThunk' True (ThunkPackConfig False (ThunkConfig Nothing) ThunkScheme_Keep) p'
       callProcessAndLogOutput (Notice, Error) $
         proc cp ["-r", "-T", p', p]
 
 finalMsg :: Bool -> (a -> Text) -> Maybe (a -> Text)
 finalMsg noTrail s = if noTrail then Nothing else Just s
 
-unpackThunk :: MonadObelisk m => FilePath -> m ()
+unpackThunk :: MonadObelisk m => ThunkScheme -> FilePath -> m ()
 unpackThunk = unpackThunk' False
 
 -- | Check that we are not somewhere inside the thunk directory
@@ -656,16 +689,17 @@ checkThunkDirectory msg thunkDir = do
   thunkDir' <- liftIO $ canonicalizePath thunkDir
   when (thunkDir' `L.isInfixOf` currentDir) $ failWith msg
 
-unpackThunk' :: MonadObelisk m => Bool -> FilePath -> m ()
-unpackThunk' noTrail thunkDir = checkThunkDirectory "Can't pack/unpack from within the thunk directory" thunkDir >> readThunk thunkDir >>= \case
+unpackThunk' :: MonadObelisk m => Bool -> ThunkScheme -> FilePath -> m ()
+unpackThunk' noTrail tScheme thunkDir = checkThunkDirectory "Can't pack/unpack from within the thunk directory" thunkDir >> readThunk thunkDir >>= \case
   Left err -> failWith $ "thunk unpack: " <> T.pack (show err)
   --TODO: Overwrite option that rechecks out thunk; force option to do so even if working directory is dirty
   Right (ThunkData_Checkout _) -> failWith "thunk unpack: thunk is already unpacked"
   Right (ThunkData_Packed tptr) -> do
     let (thunkParent, thunkName) = splitFileName thunkDir
     withTempDirectory thunkParent thunkName $ \tmpRepo -> do
+      let overrideScheme = applyThunkScheme tScheme
       let obGitDir = tmpRepo </> ".git" </> "obelisk"
-          s = case _thunkPtr_source tptr of
+          s = overrideScheme $ case _thunkPtr_source tptr of
             ThunkSource_GitHub s' -> forgetGithub False s'
             ThunkSource_Git s' -> s'
       withSpinner' ("Fetching thunk " <> T.pack thunkName)
@@ -693,13 +727,15 @@ packThunk :: MonadObelisk m => ThunkPackConfig -> FilePath -> m ThunkPtr
 packThunk = packThunk' False
 
 packThunk' :: MonadObelisk m => Bool -> ThunkPackConfig -> FilePath -> m ThunkPtr
-packThunk' noTrail (ThunkPackConfig force thunkConfig) thunkDir = checkThunkDirectory "Can't pack/unpack from within the thunk directory" thunkDir >> readThunk thunkDir >>= \case
+packThunk' noTrail (ThunkPackConfig force thunkConfig tScheme) thunkDir = checkThunkDirectory "Can't pack/unpack from within the thunk directory" thunkDir >> readThunk thunkDir >>= \case
   Left err -> failWith $ T.pack $ "thunk pack: " <> show err
   Right (ThunkData_Packed _) -> failWith "pack: thunk is already packed"
   Right (ThunkData_Checkout _) -> do
     withSpinner' ("Packing thunk " <> T.pack thunkDir)
                  (finalMsg noTrail $ const $ "Packed thunk " <> T.pack thunkDir) $ do
-      thunkPtr <- modifyThunkPtrByConfig thunkConfig <$> getThunkPtr (not force) thunkDir
+      let overrideScheme = applyThunkScheme tScheme
+      let overrideSchemeThunkPtr = thunkPtr_source . _ThunkSource_Git %~ overrideScheme
+      thunkPtr <- modifyThunkPtrByConfig thunkConfig . overrideSchemeThunkPtr <$> getThunkPtr (not force) thunkDir
       callProcessAndLogOutput (Debug, Error) $ proc "rm" ["-rf", thunkDir]
       liftIO $ createThunk thunkDir thunkPtr
       pure thunkPtr
@@ -1011,3 +1047,18 @@ parseSshShorthand uri = do
   guard $ isNothing (T.findIndex (=='/') authAndHostname)
         && not (T.null colonAndPath)
   URI.mkURI properUri
+
+applyThunkScheme :: ThunkScheme -> GitSource -> GitSource
+applyThunkScheme = \case
+  ThunkScheme_Keep -> id
+  ThunkScheme_Https ->
+    let https = [URIQQ.scheme|https|]
+    in gitSource_url . gitUri_uri . URIL.uriScheme .~ Just https
+  ThunkScheme_Ssh ->
+    let
+      ssh = [URIQQ.scheme|ssh|]
+      setUserInfo = URIL.uriAuthority . _Right . URIL.authUserInfo .~ Just (URI.UserInfo [URIQQ.username|git|]  Nothing)
+      setScheme = URIL.uriScheme .~ Just ssh
+      uriToSsh = setUserInfo . setScheme
+    in
+      gitSource_url . gitUri_uri %~ uriToSsh

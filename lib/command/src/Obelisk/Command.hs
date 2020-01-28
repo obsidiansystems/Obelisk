@@ -28,6 +28,7 @@ import System.FilePath
 import qualified System.Info
 import System.IO (hIsTerminalDevice, stdout)
 import System.Posix.Process (executeFile)
+import Data.Char (toLower)
 
 import Obelisk.App
 import Obelisk.CliApp
@@ -229,6 +230,9 @@ thunkConfig = ThunkConfig
     <|> pure Nothing
     )
 
+forceFlag :: Parser Bool
+forceFlag = switch $ long "force" <> short 'f' <> help "Force packing thunks even if there are branches not pushed upstream, uncommitted changes, stashes. This will cause changes that have not been pushed upstream to be lost; use with care."
+
 thunkUpdateConfig :: Parser ThunkUpdateConfig
 thunkUpdateConfig = ThunkUpdateConfig
   <$> optional (strOption (long "branch" <> metavar "BRANCH" <> help "Use the given branch when looking for the latest revision"))
@@ -238,17 +242,30 @@ thunkPackConfig :: Parser ThunkPackConfig
 thunkPackConfig = ThunkPackConfig
   <$> switch (long "force" <> short 'f' <> help "Force packing thunks even if there are branches not pushed upstream, uncommitted changes, stashes. This will cause changes that have not been pushed upstream to be lost; use with care.")
   <*> thunkConfig
+  <*> thunkScheme
 
 data ThunkCommand
    = ThunkCommand_Update [FilePath] ThunkUpdateConfig
-   | ThunkCommand_Unpack [FilePath]
+   | ThunkCommand_Unpack [FilePath] ThunkScheme
    | ThunkCommand_Pack   [FilePath] ThunkPackConfig
   deriving Show
+
+thunkScheme :: Parser ThunkScheme
+thunkScheme = foldl1 (<|>)
+    [ pure ThunkScheme_Keep
+    , option parseThunkScheme (long "scheme" <> metavar "SCHEME")
+    ]
+  where
+    parseThunkScheme :: ReadM ThunkScheme
+    parseThunkScheme = eitherReader $ \s -> case map toLower s of
+      "https" -> Right ThunkScheme_Https
+      "ssh"   -> Right ThunkScheme_Ssh
+      _       -> Left $ "Unsupported scheme: '" <> s <> "'"
 
 thunkCommand :: Parser ThunkCommand
 thunkCommand = hsubparser $ mconcat
   [ command "update" $ info (ThunkCommand_Update <$> some thunkDirectoryParser <*> thunkUpdateConfig) $ progDesc "Update thunk to latest revision available"
-  , command "unpack" $ info (ThunkCommand_Unpack <$> some thunkDirectoryParser) $ progDesc "Unpack thunk into git checkout of revision it points to"
+  , command "unpack" $ info (ThunkCommand_Unpack <$> some thunkDirectoryParser <*> thunkScheme) $ progDesc "Unpack thunk into git checkout of revision it points to"
   , command "pack" $ info (ThunkCommand_Pack <$> some thunkDirectoryParser <*> thunkPackConfig) $ progDesc "Pack git checkout into thunk that points at the current branch's upstream"
   ]
 
@@ -392,7 +409,7 @@ ob = \case
   ObCommand_Run -> inNixShell' $ static run
   ObCommand_Thunk tc -> case tc of
     ThunkCommand_Update thunks config -> for_ thunks (updateThunkToLatest config)
-    ThunkCommand_Unpack thunks -> for_ thunks unpackThunk
+    ThunkCommand_Unpack thunks scheme -> for_ thunks $ unpackThunk scheme
     ThunkCommand_Pack thunks config -> for_ thunks (packThunk config)
   ObCommand_Repl -> runRepl
   ObCommand_Watch -> inNixShell' $ static runWatch

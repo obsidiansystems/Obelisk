@@ -201,7 +201,7 @@ main = do
                 "# config.android_sdk.accept_license = false;"
                 "config.android_sdk.accept_license = true;"
               <$> readfile defaultNixPath
-            nixBuild ["-A", "android.frontend"]
+          nixBuild ["-A", "android.frontend"]
 
         forM_ ["ghc", "ghcjs"] $ \compiler -> do
           let
