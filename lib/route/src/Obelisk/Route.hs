@@ -19,12 +19,10 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
 module Obelisk.Route
-  ( R
-  , (:.)
+  ( R ((:/))
+  , (:.) ((:.))
   , (?/)
   , hoistR
-  , pattern (:.)
-  , pattern (:/)
   , PageName
   , PathQuery
   , Encoder
